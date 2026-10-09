@@ -21,10 +21,11 @@ API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME")
-ADMIN_ID = 642550263  # آيدي حسابك
+ADMIN_ID = 642550263
 
 STATE_FILE = "state.json"
 MAX_FILE_SIZE_MB = 48
+TARGET_BATCH = 10  # العدد المطلوب إرساله إجبارياً في كل دورة
 
 def load_state():
     default_state = {
@@ -53,32 +54,28 @@ def save_state(state):
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 def is_arabic_text(text: str) -> bool:
-    """التحقق الصارم من وجود أحرف عربية"""
     if not text:
         return False
     arabic_chars = re.findall(r'[\u0600-\u06FF]', text)
     return len(arabic_chars) > 6
 
 async def translate_to_arabic(session: aiohttp.ClientSession, text: str) -> str:
-    """محرك ترجمة سحابي مباشر عالي السرعة"""
     if not text:
         return ""
     clean_text = text.strip().replace("\n", " ")[:1200]
 
-    # المحرك الأساسي: Google API السريع
     try:
         url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=ar&dt=t&q={urllib.parse.quote(clean_text)}"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        headers = {"User-Agent": "Mozilla/5.0"}
         async with session.get(url, headers=headers, timeout=12) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 translated = "".join([part[0] for part in data[0] if part and part[0]])
                 if is_arabic_text(translated):
                     return translated.strip()
-    except Exception as e:
-        logger.warning(f"تخطي محرك Google: {e}")
+    except Exception:
+        pass
 
-    # المحرك الاحتياطي: MyMemory API
     try:
         url = f"https://api.mymemory.translated.net/get?q={urllib.parse.quote(clean_text[:450])}&langpair=en|ar"
         async with session.get(url, timeout=10) as resp:
@@ -87,8 +84,8 @@ async def translate_to_arabic(session: aiohttp.ClientSession, text: str) -> str:
                 translated = data.get("responseData", {}).get("translatedText", "")
                 if is_arabic_text(translated):
                     return translated.strip()
-    except Exception as e:
-        logger.warning(f"تخطي محرك MyMemory: {e}")
+    except Exception:
+        pass
 
     return ""
 
@@ -101,110 +98,112 @@ ARABIC_SECTORS = [
 ]
 
 async def fetch_arabic_source(session, posted_ids):
-    sector = random.choice(ARABIC_SECTORS)
-    random_page = random.randint(1, 45)
-    query = f"language:(arabic OR ara) AND mediatype:(texts) AND ({sector})"
-    url = f"https://archive.org/advancedsearch.php?q={urllib.parse.quote(query)}&fl[]=identifier,title,creator,description,year&sort[]=publicdate desc&rows=25&page={random_page}&output=json"
+    for _ in range(4): # 4 محاولات كحد أقصى للبحث
+        sector = random.choice(ARABIC_SECTORS)
+        random_page = random.randint(1, 30)
+        # فلترة مباشرة للكتب التي تملك صيغة PDF فقط
+        query = f"language:(arabic OR ara) AND mediatype:(texts) AND format:(pdf) AND ({sector})"
+        url = f"https://archive.org/advancedsearch.php?q={urllib.parse.quote(query)}&fl[]=identifier,title,creator,description,year&sort[]=publicdate desc&rows=25&page={random_page}&output=json"
 
-    try:
-        async with session.get(url, timeout=20) as resp:
-            if resp.status != 200:
-                return None
-            data = await resp.json()
-            docs = data.get("response", {}).get("docs", [])
-            random.shuffle(docs)
-
-            for doc in docs:
-                item_id = doc.get("identifier")
-                if not item_id or item_id in posted_ids:
+        try:
+            async with session.get(url, timeout=15) as resp:
+                if resp.status != 200:
                     continue
+                data = await resp.json()
+                docs = data.get("response", {}).get("docs", [])
+                random.shuffle(docs)
 
-                meta_url = f"https://archive.org/metadata/{item_id}/files"
-                async with session.get(meta_url, timeout=20) as meta_resp:
-                    if meta_resp.status != 200:
+                for doc in docs:
+                    item_id = doc.get("identifier")
+                    if not item_id or item_id in posted_ids:
                         continue
-                    meta_data = await meta_resp.json()
-                    files = meta_data.get("result", [])
 
-                    pdf_file = None
-                    for f in files:
-                        fname = f.get("name", "")
-                        fsize = int(f.get("size", 0))
-                        if fname.lower().endswith(".pdf") and (150000 < fsize <= MAX_FILE_SIZE_MB * 1024 * 1024):
-                            pdf_file = fname
-                            break
+                    meta_url = f"https://archive.org/metadata/{item_id}/files"
+                    async with session.get(meta_url, timeout=15) as meta_resp:
+                        if meta_resp.status != 200:
+                            continue
+                        meta_data = await meta_resp.json()
+                        files = meta_data.get("result", [])
 
-                    if pdf_file:
-                        pdf_url = f"https://archive.org/download/{item_id}/{urllib.parse.quote(pdf_file)}"
-                        title = doc.get("title", "دراسة وبحث أكاديمي مرجعي")
-                        author = doc.get("creator", "باحثون وأكاديميون متخصصون")
-                        desc = doc.get("description", "دراسة علمية محكمة وبحث أكاديمي يتناول مواضيع تفصيلية ومراجع موثقة.")
-                        if isinstance(desc, list):
-                            desc = " ".join(desc)
+                        pdf_file = None
+                        for f in files:
+                            fname = f.get("name", "")
+                            fsize = int(f.get("size", 0))
+                            if fname.lower().endswith(".pdf") and (100000 < fsize <= MAX_FILE_SIZE_MB * 1024 * 1024):
+                                pdf_file = fname
+                                break
 
-                        return {
-                            "id": item_id,
-                            "title": title[:110].strip(),
-                            "authors": author if isinstance(author, str) else ", ".join(author[:2]),
-                            "category": f"كتب وبحوث عربية ({sector.split()[0]})",
-                            "summary": desc[:350].strip() + "...",
-                            "pdf_url": pdf_url,
-                            "is_arabic": True
-                        }
-    except Exception as e:
-        logger.error(f"خطأ في الأرشيف: {e}")
+                        if pdf_file:
+                            pdf_url = f"https://archive.org/download/{item_id}/{urllib.parse.quote(pdf_file)}"
+                            title = doc.get("title", "دراسة وبحث أكاديمي مرجعي")
+                            author = doc.get("creator", "باحثون وأكاديميون متخصصون")
+                            desc = doc.get("description", "دراسة علمية محكمة وبحث أكاديمي يتناول مواضيع تفصيلية ومراجع موثقة.")
+                            if isinstance(desc, list):
+                                desc = " ".join(desc)
+
+                            return {
+                                "id": item_id,
+                                "title": title[:110].strip(),
+                                "authors": author if isinstance(author, str) else ", ".join(author[:2]),
+                                "category": f"كتب وبحوث عربية ({sector.split()[0]})",
+                                "summary": desc[:350].strip() + "...",
+                                "pdf_url": pdf_url,
+                                "is_arabic": True
+                            }
+        except Exception:
+            continue
     return None
 
 async def fetch_english_source(session, posted_ids):
     categories = ["cs.AI", "cs.LG", "stat.ML", "math.ST", "physics.soc-ph"]
-    cat = random.choice(categories)
-    random_offset = random.randint(0, 300)
-    url = f"https://export.arxiv.org/api/query?search_query=cat:{cat}&sortBy=submittedDate&sortOrder=descending&start={random_offset}&max_results=15"
+    for _ in range(3):
+        cat = random.choice(categories)
+        random_offset = random.randint(0, 250)
+        url = f"https://export.arxiv.org/api/query?search_query=cat:{cat}&sortBy=submittedDate&sortOrder=descending&start={random_offset}&max_results=15"
 
-    try:
-        async with session.get(url, timeout=20) as resp:
-            if resp.status != 200:
-                return None
-            xml_text = await resp.text()
+        try:
+            async with session.get(url, timeout=15) as resp:
+                if resp.status != 200:
+                    continue
+                xml_text = await resp.text()
 
-        root = ET.fromstring(xml_text)
-        ns = {'atom': 'http://www.w3.org/2005/Atom'}
-        entries = root.findall('atom:entry', ns)
-        random.shuffle(entries)
+            root = ET.fromstring(xml_text)
+            ns = {'atom': 'http://www.w3.org/2005/Atom'}
+            entries = root.findall('atom:entry', ns)
+            random.shuffle(entries)
 
-        for entry in entries:
-            raw_id = entry.find('atom:id', ns).text.split('/')[-1]
-            if raw_id in posted_ids:
-                continue
+            for entry in entries:
+                raw_id = entry.find('atom:id', ns).text.split('/')[-1]
+                if raw_id in posted_ids:
+                    continue
 
-            en_title = entry.find('atom:title', ns).text.strip().replace("\n", " ")
-            en_summary = entry.find('atom:summary', ns).text.strip().replace("\n", " ")
-            authors = [a.find('atom:name', ns).text.strip() for a in entry.findall('atom:author', ns)]
+                en_title = entry.find('atom:title', ns).text.strip().replace("\n", " ")
+                en_summary = entry.find('atom:summary', ns).text.strip().replace("\n", " ")
+                authors = [a.find('atom:name', ns).text.strip() for a in entry.findall('atom:author', ns)]
 
-            ar_title = await translate_to_arabic(session, en_title)
-            ar_summary = await translate_to_arabic(session, en_summary)
+                ar_title = await translate_to_arabic(session, en_title)
+                ar_summary = await translate_to_arabic(session, en_summary)
 
-            # التحقق: إذا لم تكن الترجمة عربية تماماً يرفض الملف
-            if not is_arabic_text(ar_title) or not is_arabic_text(ar_summary):
-                continue
+                if not is_arabic_text(ar_title) or not is_arabic_text(ar_summary):
+                    continue
 
-            return {
-                "id": raw_id,
-                "title": ar_title[:110].strip(),
-                "authors": ", ".join(authors[:2]) + (" وآخرون" if len(authors) > 2 else ""),
-                "category": "أبحاث علمية عالمية (مترجمة)",
-                "summary": ar_summary[:350].strip() + "...",
-                "pdf_url": f"https://arxiv.org/pdf/{raw_id}.pdf",
-                "is_arabic": False
-            }
-    except Exception as e:
-        logger.error(f"خطأ في arXiv: {e}")
+                return {
+                    "id": raw_id,
+                    "title": ar_title[:110].strip(),
+                    "authors": ", ".join(authors[:2]) + (" وآخرون" if len(authors) > 2 else ""),
+                    "category": "أبحاث علمية عالمية (مترجمة)",
+                    "summary": ar_summary[:350].strip() + "...",
+                    "pdf_url": f"https://arxiv.org/pdf/{raw_id}.pdf",
+                    "is_arabic": False
+                }
+        except Exception:
+            continue
     return None
 
 async def download_file(session, url, file_path):
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        async with session.get(url, headers=headers, timeout=90) as resp:
+        async with session.get(url, headers=headers, timeout=70) as resp:
             if resp.status == 200:
                 with open(file_path, 'wb') as f:
                     while True:
@@ -213,8 +212,8 @@ async def download_file(session, url, file_path):
                             break
                         f.write(chunk)
                 return True
-    except Exception as e:
-        logger.error(f"فشل التحميل: {e}")
+    except Exception:
+        pass
     return False
 
 async def handle_admin_commands(app: Client, state: dict):
@@ -260,7 +259,7 @@ async def send_admin_report(app: Client, state: dict, sent_this_round: int):
         "📊 **تقرير الأداء الأكاديمي**\n"
         "────────────────────\n"
         f"⚙️ **الحالة:** {status_str}\n"
-        f"🚀 **نُشر في هذه الدورة:** `{sent_this_round}` ملف\n"
+        f"🚀 **نُشر في هذه الدورة:** `{sent_this_round}` ملف من أصل 10\n"
         f"📈 **إجمالي المنشورات الكلي:** `{total}` ملف\n"
         "────────────────────\n"
         f"📚 **كتب ومصادر عربية (80%):** `{state['arabic_posts']}`\n"
@@ -296,8 +295,7 @@ async def main():
             "تابع كل جديد عبر القناة المخصصة للأدوات:"
         )
 
-        # جدول الحصص الصارم بنسبة 80% عربي و 20% إنجليزي في كل دورة
-        # 4 عربي ثم 1 إنجليزي | 4 عربي ثم 1 إنجليزي = 8 عربي (80%) و 2 إنجليزي (20%)
+        # خطة الحصص الصارمة (8 عربي و 2 إنجليزي = 100% نسبة 80:20)
         quota_plan = [
             "arabic", "arabic", "arabic", "arabic", "english",
             "arabic", "arabic", "arabic", "arabic", "english"
@@ -305,15 +303,19 @@ async def main():
 
         async with aiohttp.ClientSession() as session:
             for task_type in quota_plan:
+                # محاولة جلب الملف وتكرار المحاولة إن لم يتوفر حتى يكتمل هذا المنشور
                 paper = None
-                
-                if task_type == "arabic":
-                    paper = await fetch_arabic_source(session, posted_ids)
-                else:
-                    paper = await fetch_english_source(session, posted_ids)
-                    # احتياط: إن تعذر الإنجليزي أو فشلت ترجمته يستبدل بعربي
-                    if not paper:
+                for attempt in range(5):
+                    if task_type == "arabic":
                         paper = await fetch_arabic_source(session, posted_ids)
+                    else:
+                        paper = await fetch_english_source(session, posted_ids)
+                        if not paper:
+                            paper = await fetch_arabic_source(session, posted_ids)
+
+                    if paper:
+                        break
+                    await asyncio.sleep(2)
 
                 if not paper:
                     continue
@@ -329,42 +331,39 @@ async def main():
                         f"📝 **الملخص بالعربية:**\n{paper['summary']}"
                     )
 
-                    success = False
-                    while not success:
-                        try:
-                            await app.send_document(
-                                chat_id=CHANNEL_USERNAME,
-                                document=temp_file,
-                                caption=caption,
-                                parse_mode=ParseMode.MARKDOWN,
-                                file_name=f"{paper['title'][:35].strip()}.pdf"
-                            )
-                            success = True
-                            posted_ids.add(paper["id"])
-                            sent_in_this_run += 1
+                    try:
+                        await app.send_document(
+                            chat_id=CHANNEL_USERNAME,
+                            document=temp_file,
+                            caption=caption,
+                            parse_mode=ParseMode.MARKDOWN,
+                            file_name=f"{paper['title'][:35].strip()}.pdf"
+                        )
+                        posted_ids.add(paper["id"])
+                        sent_in_this_run += 1
 
-                            if paper.get("is_arabic"):
-                                state["arabic_posts"] = state.get("arabic_posts", 0) + 1
-                            else:
-                                state["english_posts"] = state.get("english_posts", 0) + 1
+                        if paper.get("is_arabic"):
+                            state["arabic_posts"] = state.get("arabic_posts", 0) + 1
+                        else:
+                            state["english_posts"] = state.get("english_posts", 0) + 1
 
-                            # إرسال إعلان الأدوات كل 30 منشور
-                            if total_posts % 30 == 0:
-                                await asyncio.sleep(3)
-                                await app.send_message(CHANNEL_USERNAME, promo_text, reply_markup=promo_markup, parse_mode=ParseMode.MARKDOWN)
-                                state["promo_posts"] = state.get("promo_posts", 0) + 1
+                        # فحص شرط الإعلان الترويجي كل 30 منشور
+                        if total_posts % 30 == 0:
+                            await asyncio.sleep(3)
+                            await app.send_message(CHANNEL_USERNAME, promo_text, reply_markup=promo_markup, parse_mode=ParseMode.MARKDOWN)
+                            state["promo_posts"] = state.get("promo_posts", 0) + 1
 
-                        except FloodWait as e:
-                            logger.warning(f"انتظار FloodWait: {e.value} ثانية...")
-                            await asyncio.sleep(e.value + 2)
-                        except Exception as e:
-                            logger.error(f"خطأ الإرسال: {e}")
-                            break
-                        finally:
-                            if os.path.exists(temp_file):
-                                os.remove(temp_file)
+                    except FloodWait as e:
+                        logger.warning(f"انتظار FloodWait: {e.value} ثانية...")
+                        await asyncio.sleep(e.value + 2)
+                    except Exception as e:
+                        logger.error(f"خطأ الإرسال: {e}")
+                    finally:
+                        if os.path.exists(temp_file):
+                            os.remove(temp_file)
 
-                    await asyncio.sleep(25)
+                    # فاصل زمني آمن 20 ثانية بين كل كتاب
+                    await asyncio.sleep(20)
 
     state["total_posts"] = total_posts
     state["posted_ids"] = list(posted_ids)
