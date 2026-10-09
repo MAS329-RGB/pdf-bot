@@ -1,14 +1,9 @@
 {
-  "total_posts": 9,
-  "posted_ids": [
-    "2610.12437v1",
-    "BBib-Alex-04110",
-    "2_20250119_20250119_2339",
-    "2610.12466v1",
-    "SharhShawahid",
-    "2610.11929v1",
-    "20260716_20260716_1016",
-    "DourManthurO",
-    "lis01825"
-  ]
+  "total_posts": 0,
+  "arabic_posts": 0,
+  "english_posts": 0,
+  "promo_posts": 0,
+  "is_paused": false,
+  "posted_ids": [],
+  "last_command_msg_id": 0
 }
