@@ -1,26 +1,32 @@
-name: PDF Fetcher Bot Automation
+name: Hourly Academia PDF Publisher
 
 on:
   schedule:
-    - cron: '0 */2 * * *'
+    # التشغيل التلقائي كل ساعة في الدقيقة 0
+    - cron: '0 * * * *'
   workflow_dispatch:
 
+permissions:
+  contents: write  # تفعيل صلاحية كتابة ملف state.json تلقائياً
+
 jobs:
-  run-bot:
+  run-publisher:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Install Dependencies
         run: |
           pip install -r requirements.txt
 
-      - name: Run Script
+      - name: Execute Academia Publisher
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
@@ -28,3 +34,11 @@ jobs:
           CHANNEL_USERNAME: ${{ secrets.CHANNEL_USERNAME }}
         run: |
           python fetcher.py
+
+      - name: Save State and Counter
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add state.json || true
+          git diff-index --quiet HEAD || git commit -m "Update post counter and state [skip ci]"
+          git push
