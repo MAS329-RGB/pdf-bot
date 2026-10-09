@@ -4,10 +4,10 @@ import json
 import asyncio
 import logging
 import random
+import re
 import urllib.parse
 import xml.etree.ElementTree as ET
 import aiohttp
-from deep_translator import GoogleTranslator
 from pyrogram import Client
 from pyrogram.enums import ParseMode
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -16,17 +16,15 @@ from pyrogram.errors import FloodWait
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - [%(levelname)s] - %(message)s")
 logger = logging.getLogger(__name__)
 
-# المفاتيح
+# المتغيرات الأساسية
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME")
-ADMIN_ID = 642550263
+ADMIN_ID = 642550263  # آيدي حسابك
 
 STATE_FILE = "state.json"
 MAX_FILE_SIZE_MB = 48
-# نرسل 10 ملفات في الدورة الواحدة (كل 10 دقائق = 60 ملف في الساعة = 1440 ملف يومياً)
-BATCH_SIZE = 10  
 
 def load_state():
     default_state = {
@@ -49,22 +47,51 @@ def load_state():
     return default_state
 
 def save_state(state):
-    # الاحتفاظ بآخر 20,000 معرف كتاب لمنع التكرار إطلاقاً
-    if len(state["posted_ids"]) > 20000:
-        state["posted_ids"] = state["posted_ids"][-20000:]
+    if len(state["posted_ids"]) > 25000:
+        state["posted_ids"] = state["posted_ids"][-25000:]
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
-def translate_to_arabic(text: str) -> str:
+def is_arabic_text(text: str) -> bool:
+    """التحقق الصارم من وجود أحرف عربية"""
+    if not text:
+        return False
+    arabic_chars = re.findall(r'[\u0600-\u06FF]', text)
+    return len(arabic_chars) > 6
+
+async def translate_to_arabic(session: aiohttp.ClientSession, text: str) -> str:
+    """محرك ترجمة سحابي مباشر عالي السرعة"""
     if not text:
         return ""
-    try:
-        translated = GoogleTranslator(source='en', target='ar').translate(text[:1200])
-        return translated if translated else text
-    except Exception:
-        return text
+    clean_text = text.strip().replace("\n", " ")[:1200]
 
-# تصنيفات موسعة وضخمة جداً للمصادر العربية
+    # المحرك الأساسي: Google API السريع
+    try:
+        url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=ar&dt=t&q={urllib.parse.quote(clean_text)}"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        async with session.get(url, headers=headers, timeout=12) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                translated = "".join([part[0] for part in data[0] if part and part[0]])
+                if is_arabic_text(translated):
+                    return translated.strip()
+    except Exception as e:
+        logger.warning(f"تخطي محرك Google: {e}")
+
+    # المحرك الاحتياطي: MyMemory API
+    try:
+        url = f"https://api.mymemory.translated.net/get?q={urllib.parse.quote(clean_text[:450])}&langpair=en|ar"
+        async with session.get(url, timeout=10) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                translated = data.get("responseData", {}).get("translatedText", "")
+                if is_arabic_text(translated):
+                    return translated.strip()
+    except Exception as e:
+        logger.warning(f"تخطي محرك MyMemory: {e}")
+
+    return ""
+
 ARABIC_SECTORS = [
     "تاريخ الأندلس والحروب", "تاريخ الدولة العباسية والأموية", "المخطوطات العربية النادرة",
     "رسائل ماجستير في التاريخ", "أطروحات دكتوراه في العلوم الإنسانية", "بحوث علم النفس والتربية",
@@ -75,7 +102,7 @@ ARABIC_SECTORS = [
 
 async def fetch_arabic_source(session, posted_ids):
     sector = random.choice(ARABIC_SECTORS)
-    random_page = random.randint(1, 40) # التنقل في أعماق آلاف الصفحات لمنع التكرار
+    random_page = random.randint(1, 45)
     query = f"language:(arabic OR ara) AND mediatype:(texts) AND ({sector})"
     url = f"https://archive.org/advancedsearch.php?q={urllib.parse.quote(query)}&fl[]=identifier,title,creator,description,year&sort[]=publicdate desc&rows=25&page={random_page}&output=json"
 
@@ -125,14 +152,14 @@ async def fetch_arabic_source(session, posted_ids):
                             "is_arabic": True
                         }
     except Exception as e:
-        logger.error(f"خطأ في جلب الأرشيف: {e}")
+        logger.error(f"خطأ في الأرشيف: {e}")
     return None
 
 async def fetch_english_source(session, posted_ids):
-    categories = ["cs.AI", "cs.LG", "stat.ML", "math.ST", "physics.soc-ph", "econ.GN", "q-bio.QM"]
+    categories = ["cs.AI", "cs.LG", "stat.ML", "math.ST", "physics.soc-ph"]
     cat = random.choice(categories)
-    random_offset = random.randint(0, 300) # القفز لصفحات قديمة وحديثة لمنع التكرار
-    url = f"https://export.arxiv.org/api/query?search_query=cat:{cat}&sortBy=submittedDate&sortOrder=descending&start={random_offset}&max_results=20"
+    random_offset = random.randint(0, 300)
+    url = f"https://export.arxiv.org/api/query?search_query=cat:{cat}&sortBy=submittedDate&sortOrder=descending&start={random_offset}&max_results=15"
 
     try:
         async with session.get(url, timeout=20) as resp:
@@ -154,8 +181,12 @@ async def fetch_english_source(session, posted_ids):
             en_summary = entry.find('atom:summary', ns).text.strip().replace("\n", " ")
             authors = [a.find('atom:name', ns).text.strip() for a in entry.findall('atom:author', ns)]
 
-            ar_title = translate_to_arabic(en_title)
-            ar_summary = translate_to_arabic(en_summary)
+            ar_title = await translate_to_arabic(session, en_title)
+            ar_summary = await translate_to_arabic(session, en_summary)
+
+            # التحقق: إذا لم تكن الترجمة عربية تماماً يرفض الملف
+            if not is_arabic_text(ar_title) or not is_arabic_text(ar_summary):
+                continue
 
             return {
                 "id": raw_id,
@@ -167,7 +198,7 @@ async def fetch_english_source(session, posted_ids):
                 "is_arabic": False
             }
     except Exception as e:
-        logger.error(f"خطأ في جلب arXiv: {e}")
+        logger.error(f"خطأ في arXiv: {e}")
     return None
 
 async def download_file(session, url, file_path):
@@ -197,7 +228,14 @@ async def handle_admin_commands(app: Client, state: dict):
                 await msg.reply_text("⏸ تم إيقاف النشر التلقائي مؤقتاً.")
             elif text == "/resume":
                 state["is_paused"] = False
-                await msg.reply_text("▶️ تم استئناف النشر التلقائي المكثف بنجاح.")
+                await msg.reply_text("▶️ تم استئناف النشر التلقائي بنجاح.")
+            elif text == "/reset":
+                state["total_posts"] = 0
+                state["arabic_posts"] = 0
+                state["english_posts"] = 0
+                state["promo_posts"] = 0
+                state["posted_ids"] = []
+                await msg.reply_text("🔄 تم تصفير العداد وسجل المنشورات بنجاح! المنشور القادم سيكون #1.")
             elif text == "/promo":
                 promo_markup = InlineKeyboardMarkup([[InlineKeyboardButton("الانضمام إلى قناة الأدوات 🚀", url="https://t.me/AKADEME_GG")]])
                 promo_text = (
@@ -217,20 +255,20 @@ async def handle_admin_commands(app: Client, state: dict):
 async def send_admin_report(app: Client, state: dict, sent_this_round: int):
     total = state["total_posts"]
     next_promo = 30 - (total % 30) if (total % 30) != 0 else 30
-    status_str = "⏸ متوقف" if state["is_paused"] else "⚡ نشط بأقصى طاقة"
+    status_str = "⏸ متوقف" if state["is_paused"] else "⚡ نشط بأقصى سرعة"
     msg = (
-        "📊 **تقرير الأداء الأكاديمي المكثف**\n"
+        "📊 **تقرير الأداء الأكاديمي**\n"
         "────────────────────\n"
         f"⚙️ **الحالة:** {status_str}\n"
-        f"🚀 **نُشر في هذه الجولة:** `{sent_this_round}` ملف\n"
-        f"📈 **إجمالي المنشورات الكلي:** `{total}` ملف منشور\n"
+        f"🚀 **نُشر في هذه الدورة:** `{sent_this_round}` ملف\n"
+        f"📈 **إجمالي المنشورات الكلي:** `{total}` ملف\n"
         "────────────────────\n"
-        f"📚 **كتب ومصادر عربية:** `{state['arabic_posts']}`\n"
-        f"🌐 **أبحاث مترجمة:** `{state['english_posts']}`\n"
+        f"📚 **كتب ومصادر عربية (80%):** `{state['arabic_posts']}`\n"
+        f"🌐 **أبحاث مترجمة (20%):** `{state['english_posts']}`\n"
         f"📢 **الإعلانات المنشورة:** `{state['promo_posts']}`\n"
         f"⏳ **المتبقي على الإعلان القادم:** `{next_promo}` منشور\n"
         "────────────────────\n"
-        "للتحكم: `/pause` للإيقاف | `/resume` للاستئناف | `/promo` للإعلان"
+        "التحكم: `/reset` لتصفير العداد | `/pause` للإيقاف | `/resume` للاستئناف | `/promo` للإعلان"
     )
     try:
         await app.send_message(ADMIN_ID, msg, parse_mode=ParseMode.MARKDOWN)
@@ -258,14 +296,24 @@ async def main():
             "تابع كل جديد عبر القناة المخصصة للأدوات:"
         )
 
+        # جدول الحصص الصارم بنسبة 80% عربي و 20% إنجليزي في كل دورة
+        # 4 عربي ثم 1 إنجليزي | 4 عربي ثم 1 إنجليزي = 8 عربي (80%) و 2 إنجليزي (20%)
+        quota_plan = [
+            "arabic", "arabic", "arabic", "arabic", "english",
+            "arabic", "arabic", "arabic", "arabic", "english"
+        ]
+
         async with aiohttp.ClientSession() as session:
-            for _ in range(BATCH_SIZE):
-                is_arabic = random.random() < 0.8
+            for task_type in quota_plan:
                 paper = None
-                if is_arabic:
+                
+                if task_type == "arabic":
                     paper = await fetch_arabic_source(session, posted_ids)
-                if not paper:
+                else:
                     paper = await fetch_english_source(session, posted_ids)
+                    # احتياط: إن تعذر الإنجليزي أو فشلت ترجمته يستبدل بعربي
+                    if not paper:
+                        paper = await fetch_arabic_source(session, posted_ids)
 
                 if not paper:
                     continue
@@ -307,22 +355,20 @@ async def main():
                                 state["promo_posts"] = state.get("promo_posts", 0) + 1
 
                         except FloodWait as e:
-                            logger.warning(f"تيليجرام يطلب الانتظار: {e.value} ثانية...")
+                            logger.warning(f"انتظار FloodWait: {e.value} ثانية...")
                             await asyncio.sleep(e.value + 2)
                         except Exception as e:
-                            logger.error(f"خطأ أثناء الإرسال: {e}")
+                            logger.error(f"خطأ الإرسال: {e}")
                             break
                         finally:
                             if os.path.exists(temp_file):
                                 os.remove(temp_file)
 
-                    # فاصل زمني ذكي 25 ثانية بين كل ملف لضمان عدم الحظر
                     await asyncio.sleep(25)
 
     state["total_posts"] = total_posts
     state["posted_ids"] = list(posted_ids)
 
-    # إرسال التقرير للأدمن
     await send_admin_report(app, state, sent_in_this_run)
     await app.stop()
     save_state(state)
