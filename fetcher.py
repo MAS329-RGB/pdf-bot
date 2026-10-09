@@ -15,43 +15,56 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - [%(levelname)s] - %(message)s")
 logger = logging.getLogger(__name__)
 
-# جلب المفاتيح من متغيرات البيئة
+# المتغيرات الأساسية
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME")
+ADMIN_ID = 642550263  # آيدي حسابك للتحكم والإحصائيات
 
 STATE_FILE = "state.json"
-MAX_FILE_SIZE_MB = 45  # حد تليجرام للبوتات 50 ميغابايت، نعتمد 45 كحد أقصى للأمان
-BATCH_COUNT = 10       # عدد الملفات المرسلة في كل ساعة
+MAX_FILE_SIZE_MB = 45  # حد الأمان لحجم الملفات
+DEFAULT_BATCH = 10     # عدد الملفات في كل دفعة
 
 def load_state():
+    default_state = {
+        "total_posts": 0,
+        "arabic_posts": 0,
+        "english_posts": 0,
+        "promo_posts": 0,
+        "is_paused": False,
+        "posted_ids": [],
+        "last_command_msg_id": 0
+    }
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+                default_state.update(data)
+                return default_state
         except Exception:
             pass
-    return {"total_posts": 0, "posted_ids": []}
+    return default_state
 
 def save_state(state):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 def translate_to_arabic(text: str) -> str:
-    """ترجمة النصوص الإنجليزية إلى العربية تلقائياً"""
+    """ترجمة النصوص الإنجليزية بدقة إلى العربية"""
+    if not text:
+        return ""
     try:
-        if not text:
-            return ""
-        return GoogleTranslator(source='auto', target='ar').translate(text[:1200])
+        translated = GoogleTranslator(source='en', target='ar').translate(text[:1500])
+        return translated if translated else text
     except Exception as e:
-        logger.warning(f"تعذر الترجمة: {e}")
+        logger.warning(f"فشل المترجم: {e}")
         return text
 
 # ----------------- جلب المصادر العربية (80%) -----------------
 ARABIC_KEYWORDS = [
     "تاريخ", "رسالة ماجستير", "بحوث جامعية", "تقرير جامعي", 
-    "أطروحة دكتوراه", "حضارة إسلامية", "فلسفة وفكر", "علوم ولغة عربية", "دراسات تاريخية"
+    "أطروحة دكتوراه", "حضارة وتراث", "فلسفة وفكر", "دراسات تاريخية", "مصادر ومراجع"
 ]
 
 async def fetch_arabic_source(session, posted_ids):
@@ -72,7 +85,6 @@ async def fetch_arabic_source(session, posted_ids):
                 if item_id in posted_ids:
                     continue
 
-                # الاستعلام عن ملف PDF المباشر
                 meta_url = f"https://archive.org/metadata/{item_id}/files"
                 async with session.get(meta_url, timeout=20) as meta_resp:
                     if meta_resp.status != 200:
@@ -84,7 +96,7 @@ async def fetch_arabic_source(session, posted_ids):
                     for f in files:
                         fname = f.get("name", "")
                         fsize = int(f.get("size", 0))
-                        if fname.lower().endswith(".pdf") and fsize <= (MAX_FILE_SIZE_MB * 1024 * 1024) and fsize > 100000:
+                        if fname.lower().endswith(".pdf") and (100000 < fsize <= MAX_FILE_SIZE_MB * 1024 * 1024):
                             pdf_file = fname
                             break
 
@@ -98,20 +110,20 @@ async def fetch_arabic_source(session, posted_ids):
 
                         return {
                             "id": item_id,
-                            "title": title[:100],
+                            "title": title[:110],
                             "authors": author if isinstance(author, str) else ", ".join(author[:2]),
                             "category": f"دراسات عربية وأكاديمية ({keyword})",
-                            "summary": desc[:350].strip() + "...",
+                            "summary": desc[:380].strip() + "...",
                             "pdf_url": pdf_url,
-                            "type": "arabic"
+                            "is_arabic": True
                         }
     except Exception as e:
         logger.error(f"خطأ أثناء جلب المصدر العربي: {e}")
     return None
 
-# ----------------- جلب المصادر الإنجليزية (20%) -----------------
+# ----------------- جلب المصادر الإنجليزية وترجمتها (20%) -----------------
 async def fetch_english_source(session, posted_ids):
-    categories = ["cs.AI", "cs.LG", "stat.ML", "physics.soc-ph"]
+    categories = ["cs.AI", "cs.LG", "stat.ML", "math.ST", "physics.soc-ph"]
     cat = random.choice(categories)
     url = f"https://export.arxiv.org/api/query?search_query=cat:{cat}&sortBy=submittedDate&sortOrder=descending&max_results=20"
     
@@ -134,25 +146,24 @@ async def fetch_english_source(session, posted_ids):
             en_summary = entry.find('atom:summary', ns).text.strip().replace("\n", " ")
             authors = [a.find('atom:name', ns).text.strip() for a in entry.findall('atom:author', ns)]
 
-            # ترجمة المحتوى إلى العربية
+            # ترجمة العنوان والملخص بالكامل إلى العربية
             ar_title = translate_to_arabic(en_title)
-            ar_summary = translate_to_arabic(en_summary[:500])
+            ar_summary = translate_to_arabic(en_summary)
 
             pdf_url = f"https://arxiv.org/pdf/{raw_id}.pdf"
             return {
                 "id": raw_id,
-                "title": ar_title[:100],
+                "title": ar_title[:110],
                 "authors": ", ".join(authors[:2]) + (" وآخرون" if len(authors) > 2 else ""),
-                "category": "أبحاث عالمية مترجمة (علوم حديثة وتقنية)",
-                "summary": ar_summary[:350].strip() + "...",
+                "category": "أبحاث علمية عالمية (مترجمة)",
+                "summary": ar_summary[:380].strip() + "...",
                 "pdf_url": pdf_url,
-                "type": "english"
+                "is_arabic": False
             }
     except Exception as e:
         logger.error(f"خطأ أثناء جلب البحث الإنجليزي: {e}")
     return None
 
-# ----------------- تنزيل الملف وحفظه -----------------
 async def download_file(session, url, file_path):
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
@@ -169,11 +180,81 @@ async def download_file(session, url, file_path):
         logger.error(f"فشل التحميل: {e}")
     return False
 
-# ----------------- الإرسال الرئيسي -----------------
+# ----------------- معالجة رسائل المطور والإحصائيات -----------------
+async def handle_admin_commands(app: Client, state: dict):
+    """فحص الأوامر المرسلة من حساب الأدمن في الخاص"""
+    try:
+        async for msg in app.get_chat_history(ADMIN_ID, limit=5):
+            if msg.id <= state.get("last_command_msg_id", 0):
+                break
+            
+            text = (msg.text or "").strip().lower()
+            if text == "/pause":
+                state["is_paused"] = True
+                await msg.reply_text("⏸ تم إيقاف النشر التلقائي مؤقتاً بنجاح.")
+            elif text == "/resume":
+                state["is_paused"] = False
+                await msg.reply_text("▶️ تم استئناف النشر التلقائي بنجاح.")
+            elif text == "/promo":
+                # إرسال الإعلان يدوياً فوراً
+                promo_markup = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("الانضمام إلى قناة الأدوات 🚀", url="https://t.me/AKADEME_GG")]
+                ])
+                promo_text = (
+                    "🚀 **منظومة أدوات أكاديميا | Academia بين يديك!**\n\n"
+                    "لا تكتفِ بالمكتبة فقط، احصل على تجربة أكاديمية كاملة مع أدواتنا الذكية:\n"
+                    "🔍 **مُعِين** — للبحث في البحوث والمصادر.\n"
+                    "📄 **غِلاف** — لإنشاء غلاف تقريرك الجامعي بثوانٍ والكثير أيضاً.\n\n"
+                    "تابع كل جديد عبر القناة المخصصة للأدوات:"
+                )
+                await app.send_message(CHANNEL_USERNAME, promo_text, reply_markup=promo_markup, parse_mode=ParseMode.MARKDOWN)
+                await msg.reply_text("✅ تم إرسال إعلان منظومة أكاديميا إلى القناة الآن!")
+            elif text == "/stats":
+                pass # سيتم إرسال بطاقة الإحصائيات في النهاية
+                
+            if msg.id > state.get("last_command_msg_id", 0):
+                state["last_command_msg_id"] = msg.id
+    except Exception as e:
+        logger.info(f"ملاحظة عند فحص رسائل الأدمن: {e}")
+
+async def send_admin_dashboard(app: Client, state: dict, sent_this_round: int):
+    """إرسال لوحة الإحصائيات إلى حساب الأدمن"""
+    total = state["total_posts"]
+    ar_count = state["arabic_posts"]
+    en_count = state["english_posts"]
+    promo_count = state["promo_posts"]
+    next_promo = 30 - (total % 30) if (total % 30) != 0 else 30
+    status_text = "⏸ متوقف مؤقتاً" if state["is_paused"] else "🟢 نشط ويعمل"
+
+    dashboard = (
+        "📊 **لوحة تحكم وإحصائيات منظومة أكاديميا**\n"
+        "────────────────────\n"
+        f"⚙️ **حالة النظام:** {status_text}\n"
+        f"📤 **الملفات المرسلة في هذه الجولة:** `{sent_this_round}` ملف\n"
+        f"📚 **إجمالي المنشورات الكلي:** `{total}` منشور\n"
+        "────────────────────\n"
+        f"📖 **الكتب والمصادر العربية:** `{ar_count}`\n"
+        f"🌐 **الأبحاث العالمية المترجمة:** `{en_count}`\n"
+        f"📢 **إعلانات الأدوات المرسلة:** `{promo_count}`\n"
+        f"⏳ **المتبقي على الإعلان القادم:** `{next_promo}` منشور\n"
+        "────────────────────\n"
+        "💡 **أوامر التحكم السريعة (أرسلها هنا في الخاص):**\n"
+        "• `/pause` للإيقاف المؤقت\n"
+        "• `/resume` لاستئناف النشر\n"
+        "• `/promo` لإرسال إعلان الأدوات فوراً\n"
+        "• `/stats` لتحديث هذه الإحصائيات"
+    )
+    try:
+        await app.send_message(chat_id=ADMIN_ID, text=dashboard, parse_mode=ParseMode.MARKDOWN)
+        logger.info("تم إرسال بطاقة الإحصائيات لحساب الأدمن بنجاح.")
+    except Exception as e:
+        logger.error(f"تعذر إرسال الإحصائيات للأدمن (تأكد من الضغط على Start للبوت أولاً): {e}")
+
+# ----------------- الدالة الرئيسية -----------------
 async def main():
     state = load_state()
-    total_posts = state.get("total_posts", 0)
-    posted_ids = set(state.get("posted_ids", []))
+    total_posts = state["total_posts"]
+    posted_ids = set(state["posted_ids"])
 
     app = Client(
         name="academia_session",
@@ -184,82 +265,93 @@ async def main():
     )
     await app.start()
 
-    promo_markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("الانضمام إلى قناة الأدوات 🚀", url="https://t.me/AKADEME_GG")]
-    ])
-    promo_text = (
-        "🚀 **منظومة أدوات أكاديميا | Academia بين يديك!**\n\n"
-        "لا تكتفِ بالمكتبة فقط، احصل على تجربة أكاديمية كاملة مع أدواتنا الذكية:\n"
-        "🔍 **مُعِين** — للبحث في البحوث والمصادر.\n"
-        "📄 **غِلاف** — لإنشاء غلاف تقريرك الجامعي بثوانٍ والكثير أيضاً.\n\n"
-        "تابع كل جديد عبر القناة المخصصة للأدوات بالضغط على الزر أدناه 👇"
-    )
+    # فحص أوامر الأدمن أولاً
+    await handle_admin_commands(app, state)
 
     sent_in_this_run = 0
-    async with aiohttp.ClientSession() as session:
-        for _ in range(BATCH_COUNT):
-            # توزيع 80% عربي و 20% إنجليزي
-            is_arabic = random.random() < 0.8
-            paper = None
-            if is_arabic:
-                paper = await fetch_arabic_source(session, posted_ids)
-            if not paper:
-                paper = await fetch_english_source(session, posted_ids)
 
-            if not paper:
-                continue
+    # إذا لم يكن النظام متوقفاً بواسطة أمر /pause
+    if not state.get("is_paused", False):
+        promo_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("الانضمام إلى قناة الأدوات 🚀", url="https://t.me/AKADEME_GG")]
+        ])
+        promo_text = (
+            "🚀 **منظومة أدوات أكاديميا | Academia بين يديك!**\n\n"
+            "لا تكتفِ بالمكتبة فقط، احصل على تجربة أكاديمية كاملة مع أدواتنا الذكية:\n"
+            "🔍 **مُعِين** — للبحث في البحوث والمصادر.\n"
+            "📄 **غِلاف** — لإنشاء غلاف تقريرك الجامعي بثوانٍ والكثير أيضاً.\n\n"
+            "تابع كل جديد عبر القناة المخصصة للأدوات:"
+        )
 
-            temp_filename = f"temp_doc_{sent_in_this_run}.pdf"
-            if await download_file(session, paper["pdf_url"], temp_filename):
-                total_posts += 1
-                caption = (
-                    f"📚 **المنشور #{total_posts}**\n\n"
-                    f"📖 **العنوان:** {paper['title']}\n"
-                    f"✍️ **المؤلف / الباحث:** {paper['authors']}\n"
-                    f"🏷 **التصنيف:** {paper['category']}\n\n"
-                    f"📝 **الملخص بالعربية:**\n{paper['summary']}\n\n"
-                    f"#منشور_{total_posts} #أكاديميا #كتب #بحوث_جامعية #رسائل_ماجستير #تاريخ"
-                )
+        async with aiohttp.ClientSession() as session:
+            for _ in range(DEFAULT_BATCH):
+                # نسبة 80% عربي و 20% إنجليزي
+                is_arabic = random.random() < 0.8
+                paper = None
+                if is_arabic:
+                    paper = await fetch_arabic_source(session, posted_ids)
+                if not paper:
+                    paper = await fetch_english_source(session, posted_ids)
 
-                try:
-                    await app.send_document(
-                        chat_id=CHANNEL_USERNAME,
-                        document=temp_filename,
-                        caption=caption,
-                        parse_mode=ParseMode.MARKDOWN,
-                        file_name=f"{paper['title'][:35].strip()}.pdf"
+                if not paper:
+                    continue
+
+                temp_file = f"temp_{sent_in_this_run}.pdf"
+                if await download_file(session, paper["pdf_url"], temp_file):
+                    total_posts += 1
+                    
+                    # الكابشن بدون أي هاشتاقات
+                    caption = (
+                        f"📚 **المنشور #{total_posts}**\n\n"
+                        f"📖 **العنوان:** {paper['title']}\n"
+                        f"✍️ **المؤلف / الباحث:** {paper['authors']}\n"
+                        f"🏷 **التصنيف:** {paper['category']}\n\n"
+                        f"📝 **الملخص بالعربية:**\n{paper['summary']}"
                     )
-                    logger.info(f"تم إرسال المنشور #{total_posts} بنجاح!")
-                    posted_ids.add(paper["id"])
-                    sent_in_this_run += 1
 
-                    # التحقق من شرط المنشور الإعلاني كل 30 ملف
-                    if total_posts % 30 == 0:
-                        await asyncio.sleep(3)
-                        await app.send_message(
+                    try:
+                        await app.send_document(
                             chat_id=CHANNEL_USERNAME,
-                            text=promo_text,
-                            reply_markup=promo_markup,
-                            parse_mode=ParseMode.MARKDOWN
+                            document=temp_file,
+                            caption=caption,
+                            parse_mode=ParseMode.MARKDOWN,
+                            file_name=f"{paper['title'][:35].strip()}.pdf"
                         )
-                        logger.info("📢 تم إرسال إعلان منظومة أكاديميا بنجاح!")
+                        posted_ids.add(paper["id"])
+                        sent_in_this_run += 1
+                        
+                        if paper.get("is_arabic"):
+                            state["arabic_posts"] = state.get("arabic_posts", 0) + 1
+                        else:
+                            state["english_posts"] = state.get("english_posts", 0) + 1
 
-                except Exception as send_err:
-                    logger.error(f"خطأ أثناء الإرسال لتليجرام: {send_err}")
-                finally:
-                    if os.path.exists(temp_filename):
-                        os.remove(temp_filename)
+                        # التحقق من شرط الإعلان كل 30 منشور
+                        if total_posts % 30 == 0:
+                            await asyncio.sleep(3)
+                            await app.send_message(
+                                chat_id=CHANNEL_USERNAME,
+                                text=promo_text,
+                                reply_markup=promo_markup,
+                                parse_mode=ParseMode.MARKDOWN
+                            )
+                            state["promo_posts"] = state.get("promo_posts", 0) + 1
 
-                # فاصل زمني بسيط بين كل ملف لتجنب الحظر المؤقت
-                await asyncio.sleep(5)
+                    except Exception as err:
+                        logger.error(f"خطأ أثناء الإرسال: {err}")
+                    finally:
+                        if os.path.exists(temp_file):
+                            os.remove(temp_file)
+
+                    await asyncio.sleep(4)
+
+    state["total_posts"] = total_posts
+    state["posted_ids"] = list(posted_ids)[-1000:]
+
+    # إرسال لوحة الإحصائيات الكاملة إلى حساب الأدمن في الخاص
+    await send_admin_dashboard(app, state, sent_in_this_run)
 
     await app.stop()
-
-    # حفظ الحالة الجديدة
-    state["total_posts"] = total_posts
-    state["posted_ids"] = list(posted_ids)[-1000:]  # الاحتفاظ بآخر 1000 معرف لتوفير المساحة
     save_state(state)
-    logger.info(f"انتهت الجولة الحالية بنجاح. إجمالي المنشورات الكلي: {total_posts}")
 
 if __name__ == "__main__":
     asyncio.run(main())
