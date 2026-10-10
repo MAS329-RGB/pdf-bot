@@ -8,6 +8,7 @@ import re
 import urllib.parse
 import xml.etree.ElementTree as ET
 import aiohttp
+from pypdf import PdfReader
 from pyrogram import Client
 from pyrogram.enums import ParseMode
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -16,6 +17,7 @@ from pyrogram.errors import FloodWait
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - [%(levelname)s] - %(message)s")
 logger = logging.getLogger(__name__)
 
+# بيانات الدخول
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -24,7 +26,8 @@ ADMIN_ID = 642550263
 
 STATE_FILE = "state.json"
 MAX_FILE_SIZE_MB = 48
-SESSION_TARGET_POSTS = 60  
+# الحد الأقصى للملفات في الجولة الواحدة لتفادي حدود وقت جيت هاب (50 ملفاً = قرابة 22 دقيقة)
+BATCH_LIMIT_PER_RUN = 50
 
 def load_state():
     default_state = {
@@ -32,8 +35,10 @@ def load_state():
         "arabic_posts": 0,
         "english_posts": 0,
         "promo_posts": 0,
+        "manual_posts": 0,
         "is_paused": False,
         "posted_ids": [],
+        "processed_file_ids": [],
         "last_command_msg_id": 0
     }
     if os.path.exists(STATE_FILE):
@@ -47,8 +52,11 @@ def load_state():
     return default_state
 
 def save_state(state):
+    # حفظ سجل 30 ألف معرف لمنع أي تكرار مستقبلي
     if len(state["posted_ids"]) > 30000:
         state["posted_ids"] = state["posted_ids"][-30000:]
+    if len(state["processed_file_ids"]) > 30000:
+        state["processed_file_ids"] = state["processed_file_ids"][-30000:]
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
@@ -74,232 +82,195 @@ async def translate_to_arabic(session: aiohttp.ClientSession, text: str) -> str:
         pass
     return ""
 
-ARABIC_KEYWORDS = [
-    "تاريخ", "دراسات", "رسالة", "أطروحة", "فلسفة", "علوم", "مكتبة", "بحث", "أدب", "حضارة"
-]
+def auto_detect_category(text: str) -> str:
+    """استنتاج التصنيف الأكاديمي تلقائياً من العنوان والنص"""
+    t = text.lower()
+    if any(k in t for k in ["تاريخ", "أندلس", "حضارة", "عصر", "معركة", "دولة", "تراث"]):
+        return "دراسات تاريخية وحضارية"
+    if any(k in t for k in ["ماجستير", "دكتوراه", "أطروحة", "رسالة", "جامعة"]):
+        return "رسائل ماجستير وأطروحات جامعية"
+    if any(k in t for k in ["قانون", "دستور", "قضاء", "محكمة", "جنائي", "حقوق"]):
+        return "دراسات قانونية وتشريعية"
+    if any(k in t for k in ["طب", "صحة", "علاج", "دواء", "سريري", "مرض"]):
+        return "علوم طبية وصحية"
+    if any(k in t for k in ["حاسوب", "ذكاء", "برمجة", "بيانات", "خوارزمية", "شبكات", "ai", "machine learning"]):
+        return "حوسبة وذكاء اصطناعي"
+    if any(k in t for k in ["اقتصاد", "محاسبة", "مالية", "تجارة", "إدارة", "تسويق"]):
+        return "إدارة وأعمال واقتصاد"
+    if any(k in t for k in ["فقه", "شريعة", "قرآن", "تفسير", "حديث", "إسلام"]):
+        return "دراسات إسلامية وشرعية"
+    if any(k in t for k in ["لغة", "بلاغة", "نحو", "أدب", "شعر", "رواية"]):
+        return "لغة عربية وآدابها"
+    return "بحوث ومصادر جامعية تخصصية"
 
-async def fetch_arabic_source(session, posted_ids):
-    for _ in range(6):
-        keyword = random.choice(ARABIC_KEYWORDS)
-        random_page = random.randint(1, 60)
-        query = f"language:(arabic OR ara) AND mediatype:(texts) AND format:(pdf) AND ({keyword})"
-        url = f"https://archive.org/advancedsearch.php?q={urllib.parse.quote(query)}&fl[]=identifier,title,creator,description&sort[]=publicdate desc&rows=35&page={random_page}&output=json"
+async def analyze_pdf_file(session: aiohttp.ClientSession, file_path: str, orig_name: str) -> dict:
+    """تحليل محتوى ملف الـ PDF وقراءة نصوصه الداخلية"""
+    clean_title = ""
+    author = "غير مسجل / باحثون متخصصون"
+    summary = ""
+    
+    try:
+        reader = PdfReader(file_path)
+        meta = reader.metadata or {}
+        if meta.title and len(meta.title.strip()) > 4:
+            clean_title = meta.title.strip()
+        if meta.author and len(meta.author.strip()) > 3:
+            author = meta.author.strip()
 
+        # استخراج نصوص الصفحات الأولى
+        extracted = ""
+        for page in reader.pages[:3]:
+            txt = page.extract_text()
+            if txt:
+                extracted += txt + " "
+
+        extracted = re.sub(r'\s+', ' ', extracted).strip()
+        if extracted:
+            summary = extracted[:450].strip()
+    except Exception as e:
+        logger.warning(f"ملاحظة عند استخراج نص PDF: {e}")
+
+    # إذا لم يتوفر عنوان بالـ Metadata، ننظف اسم الملف الأصلي
+    if not clean_title:
+        base = os.path.splitext(orig_name)[0]
+        base = re.sub(r'[_\-]+', ' ', base)
+        base = re.sub(r'\[.*?\]|\(.*?\)', '', base).strip()
+        clean_title = base if len(base) > 3 else "بحث ومصدر أكاديمي مرجعي"
+
+    # فحص اللغة: إن كان إنجليزياً، نترجمه للعربية
+    if not is_arabic_text(clean_title):
+        ar_title = await translate_to_arabic(session, clean_title)
+        if is_arabic_text(ar_title):
+            clean_title = ar_title
+
+    if summary and not is_arabic_text(summary):
+        ar_summary = await translate_to_arabic(session, summary)
+        if is_arabic_text(ar_summary):
+            summary = ar_summary
+        else:
+            summary = ""
+
+    if not summary:
+        summary = "دراسة أكاديمية وبحث مرجعي تخصصي يتناول مراجع موثقة وموضوعات مفصلة تهم الباحثين والدارسين."
+
+    category = auto_detect_category(clean_title + " " + summary)
+
+    return {
+        "title": clean_title[:110].strip(),
+        "authors": author[:60].strip(),
+        "category": category,
+        "summary": summary[:380].strip() + "..."
+    }
+
+# ----------------- فحص الملفات المحولة من الأدمن في الخاص -----------------
+async def get_queued_admin_files(app: Client, processed_ids: set) -> list:
+    """جلب كل الملفات المرسلة من الأدمن وفرزها من الأقدم للأحدث بالترتيب"""
+    queued_messages = []
+    logger.info("جاري فحص قائمة الملفات المحولة من الأدمن في الخاص...")
+
+    try:
+        # فحص آخر 500 رسالة في محادثة الأدمن
+        async for msg in app.get_chat_history(ADMIN_ID, limit=500):
+            if msg.document and msg.document.file_name:
+                fname = msg.document.file_name.lower()
+                mime = msg.document.mime_type or ""
+                if fname.endswith(".pdf") or "pdf" in mime:
+                    uid = msg.document.file_unique_id
+                    if uid not in processed_ids:
+                        if msg.document.file_size <= (MAX_FILE_SIZE_MB * 1024 * 1024):
+                            queued_messages.append(msg)
+
+        # ترتيب الرسائل تصاعدياً بحسب تاريخ الإرسال (الأقدم أولاً كما أرسلها الأدمن)
+        queued_messages.sort(key=lambda m: m.id)
+        logger.info(f"تم العثور على {len(queued_messages)} ملفاً في قائمة الانتظار.")
+    except Exception as e:
+        logger.error(f"خطأ أثناء قراءة محادثة الأدمن: {e}")
+
+    return queued_messages
+
+# ----------------- جلب الأرشيف (احتياطي عند فراغ القائمة) -----------------
+ARABIC_KEYWORDS = ["تاريخ", "دراسات", "رسالة", "أطروحة", "فلسفة", "علوم", "مكتبة", "بحث", "أدب", "حضارة"]
+
+async def fetch_archive_source(session, posted_ids):
+    for _ in range(5):
+        kw = random.choice(ARABIC_KEYWORDS)
+        url = f"https://archive.org/advancedsearch.php?q={urllib.parse.quote(f'language:(arabic OR ara) AND mediatype:(texts) AND format:(pdf) AND ({kw})')}&fl[]=identifier,title,creator,description&sort[]=publicdate desc&rows=25&page={random.randint(1, 40)}&output=json"
         try:
             async with session.get(url, timeout=15) as resp:
-                if resp.status != 200:
-                    continue
-                data = await resp.json()
-                docs = data.get("response", {}).get("docs", [])
+                if resp.status != 200: continue
+                docs = (await resp.json()).get("response", {}).get("docs", [])
                 random.shuffle(docs)
-
                 for doc in docs:
-                    item_id = doc.get("identifier")
-                    if not item_id or item_id in posted_ids:
-                        continue
-
-                    meta_url = f"https://archive.org/metadata/{item_id}/files"
-                    async with session.get(meta_url, timeout=15) as meta_resp:
-                        if meta_resp.status != 200:
-                            continue
-                        meta_data = await meta_resp.json()
-                        files = meta_data.get("result", [])
-
-                        pdf_file = None
-                        for f in files:
-                            fname = f.get("name", "")
-                            fsize = int(f.get("size", 0))
-                            if fname.lower().endswith(".pdf") and (150000 < fsize <= MAX_FILE_SIZE_MB * 1024 * 1024):
-                                pdf_file = fname
-                                break
-
-                        if pdf_file:
-                            pdf_url = f"https://archive.org/download/{item_id}/{urllib.parse.quote(pdf_file)}"
-                            title = doc.get("title", "دراسة وبحث أكاديمي مرجعي")
-                            author = doc.get("creator", "باحثون وأكاديميون متخصصون")
-                            desc = doc.get("description", "دراسة علمية محكمة وبحث أكاديمي تخصصي يتناول مراجع موثقة.")
-                            if isinstance(desc, list):
-                                desc = " ".join(desc)
-
-                            return {
-                                "id": item_id,
-                                "title": title[:110].strip(),
-                                "authors": author if isinstance(author, str) else ", ".join(author[:2]),
-                                "category": f"كتب وبحوث عربية ({keyword})",
-                                "summary": desc[:350].strip() + "...",
-                                "pdf_url": pdf_url,
-                                "is_arabic": True
-                            }
+                    iid = doc.get("identifier")
+                    if not iid or iid in posted_ids: continue
+                    meta_url = f"https://archive.org/metadata/{iid}/files"
+                    async with session.get(meta_url, timeout=15) as mresp:
+                        if mresp.status != 200: continue
+                        for f in (await mresp.json()).get("result", []):
+                            fn = f.get("name", "")
+                            fz = int(f.get("size", 0))
+                            if fn.lower().endswith(".pdf") and (150000 < fz <= MAX_FILE_SIZE_MB * 1024 * 1024):
+                                return {
+                                    "id": iid,
+                                    "url": f"https://archive.org/download/{iid}/{urllib.parse.quote(fn)}",
+                                    "title": doc.get("title", "كتاب وبحث أكاديمي مرجعي")[:100],
+                                    "author": doc.get("creator", "باحثون وأكاديميون متخصصون"),
+                                    "category": f"كتب وبحوث عربية ({kw})",
+                                    "summary": (doc.get("description", "") or "دراسة علمية محكمة وبحث أكاديمي موثق.")[:350]
+                                }
         except Exception:
             continue
     return None
 
-async def fetch_english_source(session, posted_ids):
-    categories = ["cs.AI", "cs.LG", "stat.ML", "math.ST", "physics.soc-ph"]
-    for _ in range(4):
-        cat = random.choice(categories)
-        random_offset = random.randint(0, 400)
-        url = f"https://export.arxiv.org/api/query?search_query=cat:{cat}&sortBy=submittedDate&sortOrder=descending&start={random_offset}&max_results=15"
-
-        try:
-            async with session.get(url, timeout=15) as resp:
-                if resp.status != 200:
-                    continue
-                xml_text = await resp.text()
-
-            root = ET.fromstring(xml_text)
-            ns = {'atom': 'http://www.w3.org/2005/Atom'}
-            entries = root.findall('atom:entry', ns)
-            random.shuffle(entries)
-
-            for entry in entries:
-                raw_id = entry.find('atom:id', ns).text.split('/')[-1]
-                if raw_id in posted_ids:
-                    continue
-
-                en_title = entry.find('atom:title', ns).text.strip().replace("\n", " ")
-                en_summary = entry.find('atom:summary', ns).text.strip().replace("\n", " ")
-                authors = [a.find('atom:name', ns).text.strip() for a in entry.findall('atom:author', ns)]
-
-                ar_title = await translate_to_arabic(session, en_title)
-                ar_summary = await translate_to_arabic(session, en_summary)
-
-                if not is_arabic_text(ar_title) or not is_arabic_text(ar_summary):
-                    continue
-
-                return {
-                    "id": raw_id,
-                    "title": ar_title[:110].strip(),
-                    "authors": ", ".join(authors[:2]) + (" وآخرون" if len(authors) > 2 else ""),
-                    "category": "أبحاث علمية عالمية (مترجمة)",
-                    "summary": ar_summary[:350].strip() + "...",
-                    "pdf_url": f"https://arxiv.org/pdf/{raw_id}.pdf",
-                    "is_arabic": False
-                }
-        except Exception:
-            continue
-    return None
-
-async def download_file(session, url, file_path):
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        async with session.get(url, headers=headers, timeout=60) as resp:
-            if resp.status == 200:
-                with open(file_path, 'wb') as f:
-                    while True:
-                        chunk = await resp.content.read(1024 * 64)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                return True
-    except Exception:
-        pass
-    return False
-
-async def handle_admin_commands(app: Client, state: dict):
-    try:
-        async for msg in app.get_chat_history(ADMIN_ID, limit=5):
-            if msg.id <= state.get("last_command_msg_id", 0):
-                break
-            text = (msg.text or "").strip().lower()
-            if text == "/pause":
-                state["is_paused"] = True
-                await msg.reply_text("⏸ تم إيقاف النشر التلقائي مؤقتاً.")
-            elif text == "/resume":
-                state["is_paused"] = False
-                await msg.reply_text("▶️ تم استئناف النشر التلقائي بنجاح.")
-            elif text == "/reset":
-                state["total_posts"] = 0
-                state["arabic_posts"] = 0
-                state["english_posts"] = 0
-                state["promo_posts"] = 0
-                state["posted_ids"] = []
-                await msg.reply_text("🔄 تم تصفير العداد وسجل المنشورات بنجاح! المنشور القادم سيكون #1.")
-            elif text == "/promo":
-                promo_markup = InlineKeyboardMarkup([[InlineKeyboardButton("الانضمام إلى قناة الأدوات 🚀", url="https://t.me/AKADEME_GG")]])
-                promo_text = (
-                    "🚀 **منظومة أدوات أكاديميا | Academia بين يديك!**\n\n"
-                    "لا تكتفِ بالمكتبة فقط، احصل على تجربة أكاديمية كاملة مع أدواتنا الذكية:\n"
-                    "🔍 **مُعِين** — للبحث في البحوث والمصادر.\n"
-                    "📄 **غِلاف** — لإنشاء غلاف تقريرك الجامعي بثوانٍ والكثير أيضاً.\n\n"
-                    "تابع كل جديد عبر القناة المخصصة للأدوات:"
-                )
-                await app.send_message(CHANNEL_USERNAME, promo_text, reply_markup=promo_markup, parse_mode=ParseMode.MARKDOWN)
-                await msg.reply_text("✅ تم إرسال إعلان الأدوات فوراً!")
-            if msg.id > state.get("last_command_msg_id", 0):
-                state["last_command_msg_id"] = msg.id
-    except Exception:
-        pass
-
-async def send_admin_report(app: Client, state: dict, sent_this_round: int):
-    total = state["total_posts"]
-    next_promo = 30 - (total % 30) if (total % 30) != 0 else 30
-    status_str = "⏸ متوقف" if state["is_paused"] else "⚡ نشط بأقصى طاقة ضخ"
-    msg = (
-        "📊 **تقرير الضخ الأكاديمي المكثف**\n"
-        "────────────────────\n"
-        f"⚙️ **الحالة:** {status_str}\n"
-        f"🚀 **نُشر في هذه الجلسة:** `{sent_this_round}` كتاب وبحث\n"
-        f"📈 **إجمالي المنشورات الكلي:** `{total}` ملف\n"
-        "────────────────────\n"
-        f"📚 **كتب ومصادر عربية (80%):** `{state['arabic_posts']}`\n"
-        f"🌐 **أبحاث مترجمة (20%):** `{state['english_posts']}`\n"
-        f"📢 **الإعلانات المنشورة:** `{state['promo_posts']}`\n"
-        f"⏳ **المتبقي على الإعلان القادم:** `{next_promo}` منشور\n"
-        "────────────────────\n"
-        "التحكم: `/reset` لتصفير العداد | `/pause` للإيقاف | `/resume` للاستئناف"
-    )
-    try:
-        await app.send_message(ADMIN_ID, msg, parse_mode=ParseMode.MARKDOWN)
-    except Exception:
-        pass
-
+# ----------------- الدالة الرئيسية -----------------
 async def main():
     state = load_state()
     total_posts = state["total_posts"]
     posted_ids = set(state["posted_ids"])
+    processed_file_ids = set(state.get("processed_file_ids", []))
 
     app = Client(name="academia_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
     await app.start()
 
-    await handle_admin_commands(app, state)
+    promo_markup = InlineKeyboardMarkup([[InlineKeyboardButton("الانضمام إلى قناة الأدوات 🚀", url="https://t.me/AKADEME_GG")]])
+    promo_text = (
+        "🚀 **منظومة أدوات أكاديميا | Academia بين يديك!**\n\n"
+        "لا تكتفِ بالمكتبة فقط، احصل على تجربة أكاديمية كاملة مع أدواتنا الذكية:\n"
+        "🔍 **مُعِين** — للبحث في البحوث والمصادر.\n"
+        "📄 **غِلاف** — لإنشاء غلاف تقريرك الجامعي بثوانٍ والكثير أيضاً.\n\n"
+        "تابع كل جديد عبر القناة المخصصة للأدوات:"
+    )
+
     sent_in_this_run = 0
+    queued_files = await get_queued_admin_files(app, processed_file_ids)
+    remaining_in_queue = max(0, len(queued_files) - BATCH_LIMIT_PER_RUN)
 
-    if not state.get("is_paused", False):
-        promo_markup = InlineKeyboardMarkup([[InlineKeyboardButton("الانضمام إلى قناة الأدوات 🚀", url="https://t.me/AKADEME_GG")]])
-        promo_text = (
-            "🚀 **منظومة أدوات أكاديميا | Academia بين يديك!**\n\n"
-            "لا تكتفِ بالمكتبة فقط، احصل على تجربة أكاديمية كاملة مع أدواتنا الذكية:\n"
-            "🔍 **مُعِين** — للبحث في البحوث والمصادر.\n"
-            "📄 **غِلاف** — لإنشاء غلاف تقريرك الجامعي بثوانٍ والكثير أيضاً.\n\n"
-            "تابع كل جديد عبر القناة المخصصة للأدوات:"
-        )
+    async with aiohttp.ClientSession() as session:
+        # المسار الأول: إذا كان هناك ملفات محولة من الأدمن، يتم نشرها أولاً وبالترتيب
+        if queued_files:
+            logger.info(f"بدء نشر دفعة من ملفات الأدمن المحولة (سيتم نشر حتى {BATCH_LIMIT_PER_RUN} ملفاً بالترتيب)...")
+            
+            for msg in queued_files[:BATCH_LIMIT_PER_RUN]:
+                file_uid = msg.document.file_unique_id
+                orig_filename = msg.document.file_name or "academic_document.pdf"
+                temp_pdf = f"admin_doc_{sent_in_this_run}.pdf"
 
-        async with aiohttp.ClientSession() as session:
-            while sent_in_this_run < SESSION_TARGET_POSTS:
-                is_arabic_slot = (sent_in_this_run % 5 != 4)
-                paper = None
+                try:
+                    # تحميل الملف من تليجرام
+                    await app.download_media(msg, file_name=temp_pdf)
+                    if not os.path.exists(temp_pdf):
+                        continue
 
-                if is_arabic_slot:
-                    paper = await fetch_arabic_source(session, posted_ids)
-                else:
-                    paper = await fetch_english_source(session, posted_ids)
-                    if not paper:
-                        paper = await fetch_arabic_source(session, posted_ids)
-
-                if not paper:
-                    await asyncio.sleep(2)
-                    continue
-
-                temp_file = f"temp_{sent_in_this_run % 5}.pdf"
-                if await download_file(session, paper["pdf_url"], temp_file):
+                    # تحليل الملف واستخراج البيانات
+                    info = await analyze_pdf_file(session, temp_pdf, orig_filename)
                     total_posts += 1
+
                     caption = (
                         f"📚 **المنشور #{total_posts}**\n\n"
-                        f"📖 **العنوان:** {paper['title']}\n"
-                        f"✍️ **المؤلف / الباحث:** {paper['authors']}\n"
-                        f"🏷 **التصنيف:** {paper['category']}\n\n"
-                        f"📝 **الملخص بالعربية:**\n{paper['summary']}"
+                        f"📖 **العنوان:** {info['title']}\n"
+                        f"✍️ **المؤلف / الباحث:** {info['authors']}\n"
+                        f"🏷 **التصنيف:** {info['category']}\n\n"
+                        f"📝 **الملخص بالعربية:**\n{info['summary']}"
                     )
 
                     success = False
@@ -307,21 +278,18 @@ async def main():
                         try:
                             await app.send_document(
                                 chat_id=CHANNEL_USERNAME,
-                                document=temp_file,
+                                document=temp_pdf,
                                 caption=caption,
                                 parse_mode=ParseMode.MARKDOWN,
-                                file_name=f"{paper['title'][:35].strip()}.pdf"
+                                file_name=f"{info['title'][:35].strip()}.pdf"
                             )
                             success = True
-                            posted_ids.add(paper["id"])
+                            processed_file_ids.add(file_uid)
                             sent_in_this_run += 1
-                            logger.info(f"تم إرسال المنشور #{total_posts} ({sent_in_this_run}/{SESSION_TARGET_POSTS})")
+                            state["manual_posts"] = state.get("manual_posts", 0) + 1
+                            logger.info(f"تم نشر ملف محول #{total_posts}: {info['title']}")
 
-                            if paper.get("is_arabic"):
-                                state["arabic_posts"] = state.get("arabic_posts", 0) + 1
-                            else:
-                                state["english_posts"] = state.get("english_posts", 0) + 1
-
+                            # فحص إعلان الأدوات كل 30 منشور
                             if total_posts % 30 == 0:
                                 await asyncio.sleep(2)
                                 await app.send_message(CHANNEL_USERNAME, promo_text, reply_markup=promo_markup, parse_mode=ParseMode.MARKDOWN)
@@ -331,20 +299,95 @@ async def main():
                             logger.warning(f"انتظار تيليجرام: {e.value} ثانية...")
                             await asyncio.sleep(e.value + 2)
                         except Exception as e:
-                            logger.error(f"خطأ الإرسال: {e}")
+                            logger.error(f"خطأ أثناء الإرسال: {e}")
                             break
-                        finally:
-                            if os.path.exists(temp_file):
-                                os.remove(temp_file)
 
-                    await asyncio.sleep(25)
+                except Exception as e:
+                    logger.error(f"خطأ في معالجة الملف المحول: {e}")
+                finally:
+                    if os.path.exists(temp_pdf):
+                        os.remove(temp_pdf)
 
+                # فاصل زمني آمن 20 ثانية بين كل ملف
+                await asyncio.sleep(20)
+
+        # المسار الثاني: إذا لم توجد أي ملفات محولة، يجلب من الأرشيف لضمان استمرار القناة
+        else:
+            logger.info("لا توجد ملفات محولة من الأدمن في قائمة الانتظار، جاري الجلب من الأرشيف...")
+            for _ in range(15):
+                paper = await fetch_archive_source(session, posted_ids)
+                if not paper: continue
+
+                temp_file = f"archive_{sent_in_this_run}.pdf"
+                try:
+                    headers = {"User-Agent": "Mozilla/5.0"}
+                    async with session.get(paper["url"], headers=headers, timeout=60) as resp:
+                        if resp.status == 200:
+                            with open(temp_file, 'wb') as f:
+                                f.write(await resp.read())
+                except Exception:
+                    continue
+
+                if os.path.exists(temp_file):
+                    total_posts += 1
+                    caption = (
+                        f"📚 **المنشور #{total_posts}**\n\n"
+                        f"📖 **العنوان:** {paper['title']}\n"
+                        f"✍️ **المؤلف / الباحث:** {paper['author']}\n"
+                        f"🏷 **التصنيف:** {paper['category']}\n\n"
+                        f"📝 **الملخص بالعربية:**\n{paper['summary']}"
+                    )
+                    try:
+                        await app.send_document(
+                            chat_id=CHANNEL_USERNAME,
+                            document=temp_file,
+                            caption=caption,
+                            parse_mode=ParseMode.MARKDOWN,
+                            file_name=f"{paper['title'][:35].strip()}.pdf"
+                        )
+                        posted_ids.add(paper["id"])
+                        sent_in_this_run += 1
+                        state["arabic_posts"] = state.get("arabic_posts", 0) + 1
+
+                        if total_posts % 30 == 0:
+                            await asyncio.sleep(2)
+                            await app.send_message(CHANNEL_USERNAME, promo_text, reply_markup=promo_markup, parse_mode=ParseMode.MARKDOWN)
+                            state["promo_posts"] = state.get("promo_posts", 0) + 1
+                    except Exception as e:
+                        logger.error(f"خطأ: {e}")
+                    finally:
+                        if os.path.exists(temp_file):
+                            os.remove(temp_file)
+                    await asyncio.sleep(20)
+
+    # حفظ وتحديث الحالة
     state["total_posts"] = total_posts
     state["posted_ids"] = list(posted_ids)
-
-    await send_admin_report(app, state, sent_in_this_run)
-    await app.stop()
+    state["processed_file_ids"] = list(processed_file_ids)
     save_state(state)
+
+    # إرسال تقرير الإحصائيات للأدمن
+    next_promo = 30 - (total_posts % 30) if (total_posts % 30) != 0 else 30
+    report_msg = (
+        "📊 **تقرير معالجة الملفات والضخ الأكاديمي**\n"
+        "────────────────────\n"
+        f"🚀 **نُشر في هذه الجولة:** `{sent_in_this_run}` ملف\n"
+        f"📥 **الملفات المحولة المتبقية في قائمة الانتظار:** `{remaining_in_queue}` ملف\n"
+        f"📈 **إجمالي المنشورات الكلي في القناة:** `{total_posts}` منشور\n"
+        "────────────────────\n"
+        f"📂 **منشورات من ملفاتك الخاصة:** `{state.get('manual_posts', 0)}`\n"
+        f"📚 **منشورات من الأرشيف والمصادر:** `{state.get('arabic_posts', 0)}`\n"
+        f"📢 **الإعلانات المنشورة:** `{state.get('promo_posts', 0)}`\n"
+        f"⏳ **المتبقي على الإعلان القادم:** `{next_promo}` منشور\n"
+        "────────────────────\n"
+        "💡 *يمكنك إعادة توجيه مئات الملفات للبوت في الخاص في أي وقت، وسينشرها بالترتيب تباعاً في كل جولة.*"
+    )
+    try:
+        await app.send_message(ADMIN_ID, report_msg, parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        pass
+
+    await app.stop()
 
 if __name__ == "__main__":
     asyncio.run(main())
