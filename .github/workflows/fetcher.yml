@@ -1,9 +1,10 @@
-name: Continuous Academia High-Speed Publisher
+name: Turbo Academia Max-Speed Publisher
 
 on:
   schedule:
-    # التشغيل التلقائي كل 10 دقائق على مدار الساعة
-    - cron: '*/10 * * * *'
+    # تشغيل مزدوج كل 30 دقيقة لإجبار سيرفرات جيت هاب على النشر المستمر
+    - cron: '0 * * * *'
+    - cron: '30 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -12,6 +13,8 @@ permissions:
 jobs:
   run-publisher:
     runs-on: ubuntu-latest
+    timeout-minutes: 90  # تمديد وقت الجولة حتى ساعة ونصف
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -26,7 +29,7 @@ jobs:
         run: |
           pip install -r requirements.txt
 
-      - name: Run Academia Super Publisher
+      - name: Run Turbo Publisher
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
@@ -35,10 +38,10 @@ jobs:
         run: |
           python fetcher.py
 
-      - name: Commit State & Unique IDs
+      - name: Commit State & Counter
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git add state.json || true
-          git diff-index --quiet HEAD || git commit -m "Update DB state [skip ci]"
+          git diff-index --quiet HEAD || git commit -m "Update state [skip ci]"
           git push
