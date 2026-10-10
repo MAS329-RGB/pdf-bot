@@ -1,19 +1,22 @@
 {
-  "total_posts": 9,
-  "arabic_posts": 3,
-  "english_posts": 6,
+  "total_posts": 12,
+  "arabic_posts": 4,
+  "english_posts": 8,
   "promo_posts": 0,
   "is_paused": false,
   "posted_ids": [
-    "syrbook_202212",
-    "06-0_20211028",
-    "2608.09479v1",
-    "2610.11344v1",
     "2610.03313v1",
+    "2608.09479v1",
     "2610.09505v1",
     "2610.04191v1",
+    "2609.31125v1",
+    "2610.11344v1",
     "elshandawily10289",
-    "2609.31125v1"
+    "2609.13029v1",
+    "2610.11399v1",
+    "06-0_20211028",
+    "syrbook_202212",
+    "ajbarmachmua"
   ],
   "last_command_msg_id": 0
 }
