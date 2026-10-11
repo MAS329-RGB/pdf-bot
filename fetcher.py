@@ -25,9 +25,7 @@ ADMIN_ID = 642550263
 
 STATE_FILE = "state.json"
 MAX_FILE_SIZE_MB = 48
-# رفع سقف الضخ إلى 100 ملف في الجولة الواحدة (سواء من المحول أو الأرشيف)
 MAX_BATCH_TARGET = 100  
-# أقصى سرعة آمنة في تيليجرام بين كل ملف (10 ثوانٍ)
 SEND_DELAY = 10  
 
 def load_state():
@@ -38,6 +36,7 @@ def load_state():
         "promo_posts": 0,
         "manual_posts": 0,
         "is_paused": False,
+        "fix_old_requested": False,
         "posted_ids": [],
         "processed_file_ids": [],
         "last_command_msg_id": 0
@@ -81,6 +80,16 @@ async def translate_to_arabic(session: aiohttp.ClientSession, text: str) -> str:
     except Exception:
         pass
     return ""
+
+def get_smart_header(title: str, category: str, post_num: int) -> str:
+    """تحديد التسمية الذكية (كتاب / رسالة علمية / بحث أكاديمي)"""
+    combined = (title + " " + category).lower()
+    if any(k in combined for k in ["ماجستير", "دكتوراه", "أطروحة", "رسالة"]):
+        return f"🎓 **رسالة علمية #{post_num}**"
+    elif any(k in combined for k in ["بحث", "تقرير", "ورقة علمية", "دراسة", "arxiv"]):
+        return f"📑 **بحث أكاديمي #{post_num}**"
+    else:
+        return f"📖 **كتاب #{post_num}**"
 
 def auto_detect_category(text: str) -> str:
     t = text.lower()
@@ -207,6 +216,55 @@ async def fetch_archive_source(session, posted_ids):
             continue
     return None
 
+async def handle_admin_commands(app: Client, state: dict):
+    try:
+        async for msg in app.get_chat_history(ADMIN_ID, limit=5):
+            if msg.id <= state.get("last_command_msg_id", 0):
+                break
+            text = (msg.text or "").strip().lower()
+            if text == "/pause":
+                state["is_paused"] = True
+                await msg.reply_text("⏸ تم إيقاف النشر التلقائي مؤقتاً.")
+            elif text == "/resume":
+                state["is_paused"] = False
+                await msg.reply_text("▶️ تم استئناف النشر بنجاح.")
+            elif text == "/reset":
+                state["total_posts"] = 0
+                state["posted_ids"] = []
+                await msg.reply_text("🔄 تم تصفير العداد لتبدأ المنشورات من #1.")
+            elif text == "/fix_old":
+                state["fix_old_requested"] = True
+                await msg.reply_text("🛠 تم جدولة تعديل المنشورات السابقة في القناة إلى (كتاب # / رسالة #).")
+            if msg.id > state.get("last_command_msg_id", 0):
+                state["last_command_msg_id"] = msg.id
+    except Exception:
+        pass
+
+async def fix_old_channel_posts(app: Client):
+    """تعديل المنشورات السابقة في القناة من المنشور # إلى كتاب #"""
+    logger.info("بدء فحص وتعديل المنشورات السابقة في القناة...")
+    count = 0
+    try:
+        async for msg in app.get_chat_history(CHANNEL_USERNAME, limit=150):
+            if msg.caption and "المنشور #" in msg.caption:
+                # استبدال المنشور # بـ كتاب #
+                new_caption = re.sub(r'📚\s*\*{0,2}المنشور\s*#', '📖 **كتاب #', msg.caption)
+                if new_caption != msg.caption:
+                    try:
+                        await app.edit_message_caption(
+                            chat_id=CHANNEL_USERNAME,
+                            message_id=msg.id,
+                            caption=new_caption,
+                            parse_mode=ParseMode.MARKDOWN
+                        )
+                        count += 1
+                        await asyncio.sleep(2)
+                    except Exception:
+                        pass
+        logger.info(f"تم تعديل {count} منشوراً قديماً بنجاح.")
+    except Exception as e:
+        logger.error(f"خطأ في تعديل المنشورات القديمة: {e}")
+
 async def main():
     state = load_state()
     total_posts = state["total_posts"]
@@ -215,6 +273,13 @@ async def main():
 
     app = Client(name="academia_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
     await app.start()
+
+    await handle_admin_commands(app, state)
+
+    # إذا تم طلب تعديل المنشورات القديمة
+    if state.get("fix_old_requested", False):
+        await fix_old_channel_posts(app)
+        state["fix_old_requested"] = False
 
     promo_markup = InlineKeyboardMarkup([[InlineKeyboardButton("الانضمام إلى قناة الأدوات 🚀", url="https://t.me/AKADEME_GG")]])
     promo_text = (
@@ -229,9 +294,8 @@ async def main():
     queued_files = await get_queued_admin_files(app, processed_file_ids)
 
     async with aiohttp.ClientSession() as session:
-        # حلقة الضخ الأقصى: نواصل العمل حتى نصل إلى MAX_BATCH_TARGET كاملاً (100 ملف)
         while sent_in_this_run < MAX_BATCH_TARGET:
-            # 1. الأولوية للملفات المحولة
+            # 1. نشر الملفات المحولة مع التسمية الذكية
             if queued_files:
                 msg = queued_files.pop(0)
                 file_uid = msg.document.file_unique_id
@@ -245,12 +309,13 @@ async def main():
 
                     info = await analyze_pdf_file(session, temp_pdf, orig_filename)
                     total_posts += 1
+                    header = get_smart_header(info['title'], info['category'], total_posts)
 
                     caption = (
-                        f"📚 **المنشور #{total_posts}**\n\n"
-                        f"📖 **العنوان:** {info['title']}\n"
+                        f"{header}\n\n"
+                        f"🏷 **العنوان:** {info['title']}\n"
                         f"✍️ **المؤلف / الباحث:** {info['authors']}\n"
-                        f"🏷 **التصنيف:** {info['category']}\n\n"
+                        f"🗂 **التصنيف:** {info['category']}\n\n"
                         f"📝 **الملخص بالعربية:**\n{info['summary']}"
                     )
 
@@ -268,7 +333,6 @@ async def main():
                             processed_file_ids.add(file_uid)
                             sent_in_this_run += 1
                             state["manual_posts"] = state.get("manual_posts", 0) + 1
-                            logger.info(f"نشر ملف محول #{total_posts} ({sent_in_this_run}/{MAX_BATCH_TARGET})")
 
                             if total_posts % 30 == 0:
                                 await asyncio.sleep(2)
@@ -276,10 +340,8 @@ async def main():
                                 state["promo_posts"] = state.get("promo_posts", 0) + 1
 
                         except FloodWait as e:
-                            logger.warning(f"انتظار تيليجرام FloodWait: {e.value} ثانية...")
                             await asyncio.sleep(e.value + 2)
-                        except Exception as e:
-                            logger.error(f"خطأ: {e}")
+                        except Exception:
                             break
 
                 except Exception as err:
@@ -290,7 +352,7 @@ async def main():
 
                 await asyncio.sleep(SEND_DELAY)
 
-            # 2. إذا انتهت الملفات المحولة، نستكمل العدد المتبقي من الأرشيف فوراً
+            # 2. النشر من الأرشيف بالتسمية الذكية
             else:
                 paper = await fetch_archive_source(session, posted_ids)
                 if not paper:
@@ -309,11 +371,13 @@ async def main():
 
                 if os.path.exists(temp_file):
                     total_posts += 1
+                    header = get_smart_header(paper['title'], paper['category'], total_posts)
+
                     caption = (
-                        f"📚 **المنشور #{total_posts}**\n\n"
-                        f"📖 **العنوان:** {paper['title']}\n"
+                        f"{header}\n\n"
+                        f"🏷 **العنوان:** {paper['title']}\n"
                         f"✍️ **المؤلف / الباحث:** {paper['author']}\n"
-                        f"🏷 **التصنيف:** {paper['category']}\n\n"
+                        f"🗂 **التصنيف:** {paper['category']}\n\n"
                         f"📝 **الملخص بالعربية:**\n{paper['summary']}"
                     )
                     success = False
@@ -330,17 +394,14 @@ async def main():
                             posted_ids.add(paper["id"])
                             sent_in_this_run += 1
                             state["arabic_posts"] = state.get("arabic_posts", 0) + 1
-                            logger.info(f"نشر من الأرشيف #{total_posts} ({sent_in_this_run}/{MAX_BATCH_TARGET})")
 
                             if total_posts % 30 == 0:
                                 await asyncio.sleep(2)
                                 await app.send_message(CHANNEL_USERNAME, promo_text, reply_markup=promo_markup, parse_mode=ParseMode.MARKDOWN)
                                 state["promo_posts"] = state.get("promo_posts", 0) + 1
                         except FloodWait as e:
-                            logger.warning(f"انتظار تيليجرام FloodWait: {e.value} ثانية...")
                             await asyncio.sleep(e.value + 2)
-                        except Exception as e:
-                            logger.error(f"خطأ: {e}")
+                        except Exception:
                             break
                         finally:
                             if os.path.exists(temp_file):
@@ -355,15 +416,16 @@ async def main():
 
     next_promo = 30 - (total_posts % 30) if (total_posts % 30) != 0 else 30
     report_msg = (
-        "🚀 **تقرير الضخ الأقصى (Turbo Publisher)**\n"
+        "🚀 **تقرير الترتيب والنشر الأكاديمي**\n"
         "────────────────────\n"
-        f"⚡ **نُشر في هذه الجلسة الكبرى:** `{sent_in_this_run}` ملف\n"
-        f"📈 **إجمالي منشورات القناة:** `{total_posts}` منشور\n"
+        f"⚡ **نُشر في هذه الجلسة:** `{sent_in_this_run}` ملف\n"
+        f"📈 **إجمالي منشورات القناة:** `{total_posts}`\n"
         "────────────────────\n"
         f"📂 **ملفاتك الخاصة المنشورة:** `{state.get('manual_posts', 0)}`\n"
         f"📚 **كتب الأرشيف المنشورة:** `{state.get('arabic_posts', 0)}`\n"
-        f"📢 **إعلانات الأدوات:** `{state.get('promo_posts', 0)}`\n"
-        f"⏳ **المتبقي على الإعلان القادم:** `{next_promo}` منشور"
+        f"⏳ **المتبقي على الإعلان القادم:** `{next_promo}` منشور\n"
+        "────────────────────\n"
+        "💡 *أرسل `/fix_old` لتعديل نصوص المنشورات السابقة بالقناة إلى كتاب #.*"
     )
     try:
         await app.send_message(ADMIN_ID, report_msg, parse_mode=ParseMode.MARKDOWN)
